@@ -266,6 +266,115 @@ async function persistSessionsYieldContextMessage(
   );
 }
 
+// ==== ADD THIS BLOCK ====
+
+const QWEN_TEXTUAL_TOOL_CALL_RE = /<\s*tool_call\s*>([\s\S]*?)<\s*\/\s*tool_call\s*>/gi;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function resolveTextualToolCallArguments(value: unknown): Record<string, unknown> | null {
+  if (value == null) {
+    return {};
+  }
+  if (isPlainRecord(value)) {
+    return value;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return isPlainRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePureTextualToolCallText(text: string) {
+  const matches = [...text.matchAll(QWEN_TEXTUAL_TOOL_CALL_RE)];
+  if (!matches.length) {
+    return null;
+  }
+
+  return matches.map((m) => {
+    const parsed = JSON.parse(m[1]);
+    return {
+      type: "toolCall",
+      name: normalizeToolCallNameForDispatch(parsed.name),
+      arguments: resolveTextualToolCallArguments(parsed.arguments) ?? {},
+    };
+  });
+}
+
+function promoteTextualToolCallsInMessage(message: unknown) {
+  if (!message || typeof message !== "object") {
+    return;
+  }
+
+  const msg = message as { content?: unknown };
+
+  if (!Array.isArray(msg.content)) {
+    return;
+  }
+
+  const next: unknown[] = [];
+
+  for (const block of msg.content) {
+    if (block && typeof block === "object" && block.type === "text") {
+      const text = block.text;
+      if (typeof text === "string") {
+        const parsed = parsePureTextualToolCallText(text);
+        if (parsed) {
+          next.push(...parsed);
+          continue;
+        }
+      }
+    }
+
+    next.push(block);
+  }
+
+  msg.content = next;
+}
+
+function wrapStreamPromoteTextualToolCalls(stream: unknown) {
+  if (!stream || typeof stream !== "object") {
+    return stream;
+  }
+
+  const s = stream as {
+    result: () => Promise<unknown>;
+  };
+
+  const orig = s.result.bind(s);
+
+  s.result = async () => {
+    const msg = await orig();
+    promoteTextualToolCallsInMessage(msg);
+    return msg;
+  };
+
+  return s;
+}
+
+function wrapStreamFnPromoteTextualToolCalls(baseFn: StreamFn): StreamFn {
+  return ((model, context, options) => {
+    const maybeStream = baseFn(model, context, options);
+
+    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
+      return Promise.resolve(maybeStream).then((stream) =>
+        wrapStreamPromoteTextualToolCalls(stream),
+      );
+    }
+
+    return wrapStreamPromoteTextualToolCalls(maybeStream);
+  }) as StreamFn;
+}
+
+// ==== END BLOCK ====
+
 // Remove the synthetic yield interrupt + aborted assistant entry from the live transcript.
 function stripSessionsYieldArtifacts(activeSession: {
   messages: AgentMessage[];
@@ -2350,6 +2459,9 @@ export async function runEmbeddedAttempt(
         return innerStreamFn(model, context, options);
       };
 
+      activeSession.agent.streamFn = wrapStreamFnPromoteTextualToolCalls(
+        activeSession.agent.streamFn,
+      );
       // Some models emit tool names with surrounding whitespace (e.g. " read ").
       // pi-agent-core dispatches tool calls with exact string matching, so normalize
       // names on the live response stream before tool execution.
